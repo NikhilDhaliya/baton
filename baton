@@ -1191,6 +1191,22 @@ def found_accounts():
     return out
 
 
+def gh_user():
+    """The GitHub CLI's signed-in user, read from its hosts.yml: nothing is run (gh writes state files when it runs),
+    nothing is sent, and nothing but the user name is read out."""
+    import glob
+    import re
+    config_home = os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config")
+    dirs = [os.environ.get("GH_CONFIG_DIR"), os.path.join(config_home, "gh")]
+    dirs += sorted(glob.glob(os.path.join(HOME, "snap", "gh", "*", ".config", "gh")))  # gh installed as a snap
+    for d in filter(None, dirs):
+        host = re.search(r"^github\.com:[ \t]*\n(.*?)(?=^\S|\Z)", read(os.path.join(d, "hosts.yml")), re.M | re.S)
+        user = host and re.search(r"^[ \t]+user:[ \t]*([\w-]+)", host.group(1), re.M)
+        if user:
+            return user.group(1)
+    return None
+
+
 def describe_link_or_count(d, item):
     p = os.path.join(d, item)
     if os.path.islink(p):
@@ -1243,8 +1259,8 @@ def cmd_scan(args):
     print(f"system    {osname} · python {platform.python_version()} · git {git_v} · "
           + (f"Claude Code {claude_v}" if claude_v else "`claude` command NOT on PATH (account commands and handoff need it)"))
     if shutil.which("gh"):
-        rc, user = run("gh", "config", "get", "-h", "github.com", "user")  # local config only, no network
-        print("github    " + (f"gh signed in as {user} (init --github NAME can create the private repo)" if rc == 0 and user
+        user = gh_user()
+        print("github    " + (f"gh signed in as {user} (init --github NAME can create the private repo)" if user
                                 else "gh installed, not signed in (the user runs `gh auth login`, or gives a repo URL)"))
     else:
         print("github    gh not installed (sync needs a private repo URL from the user: init --remote URL)")

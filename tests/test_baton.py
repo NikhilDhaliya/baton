@@ -423,6 +423,17 @@ class Choices(Base):
         self.assertIn("baton     not set up", out)
         self.assertNotIn("a-claude", out)  # no tokens
 
+    def test_scan_reads_gh_user_without_running_gh(self):
+        home = self.machine("a")
+        os.makedirs(os.path.join(home, ".config", "gh"))
+        with open(os.path.join(home, ".config", "gh", "hosts.yml"), "w") as f:
+            f.write("github.com:\n    users:\n        octo:\n            oauth_token: gho_" + "s" * 36
+                    + "\n    git_protocol: https\n    user: octo\n")
+        out = self.ok(home, "scan", PATH=os.path.join(home, "bin") + os.pathsep + os.environ["PATH"])
+        if shutil.which("gh"):
+            self.assertIn("gh signed in as octo", out)
+        self.assertNotIn("gho_", out)
+
     def test_pieces_can_be_left_out_and_added_later(self):
         home = self.machine("a")
         self.ok(home, "init", "--no-handoff", "--no-statusline")
