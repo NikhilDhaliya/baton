@@ -1,0 +1,1562 @@
+#!/usr/bin/env python3
+"""baton: several Claude Code accounts that work as one Claude.
+
+  baton scan [--usage]                      what this computer has; changes and sends nothing (start here)
+  baton init [--remote URL | --github NAME] [--no-handoff] [--no-statusline]
+                                            set up ~/.baton (shared rules and memory, a git repo), join ~/.claude
+  baton add [NAME] [--dir FOLDER]           add an account: `baton add` makes ~/.claude-b, started with `claudeb`
+  baton status                              usage of every account
+  baton next [--window] [--print] [PROMPT]  continue on the account with the most room
+  baton sync                                commit, pull and push ~/.baton
+  baton doctor                              check the setup
+  baton leave DIR                           take one account folder out of baton (restores its backups)
+  baton update                              install the latest baton
+
+Installed into each account's settings.json: `hook start` (SessionStart), `hook usage` (UserPromptSubmit,
+PostToolUse), `hook stop` (Stop) and `statusline`. Python 3.8+, standard library only. MIT licence.
+https://github.com/NikhilDhaliya/baton
+"""
+import os
+import sys
+import time
+
+VERSION = "0.1.0"
+REPO_RAW = "https://raw.githubusercontent.com/NikhilDhaliya/baton/main/baton"
+HOME = os.path.expanduser("~")
+BATON = os.path.abspath(os.path.expanduser(os.environ.get("BATON_HOME") or "~/.baton"))
+CACHE = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.join(HOME, ".cache"), "baton")
+BIN = os.path.join(HOME, ".local", "bin")
+SCRIPT = os.path.realpath(__file__)
+USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+if os.environ.get("BATON_USAGE_URL", "").startswith(("http://127.0.0.1:", "http://localhost:")):
+    USAGE_URL = os.environ["BATON_USAGE_URL"]  # tests only: a token never goes anywhere but Anthropic or this computer
+PROMPT = "Read HANDOFF.md and continue."
+SHARED = ("agents", "skills", "commands")  # folders every account shares, besides CLAUDE.md and memory
+FRESH, REMIND = 180, 600  # seconds: how long a usage reading lasts; gap between handoff reminders
+INDEX_LINES = 200  # Claude Code loads this many lines of MEMORY.md
+
+_config = None
+
+
+# ---------------------------------------------------------------- config, accounts, usage
+
+def config():
+    global _config
+    if _config is None:
+        import json
+        try:
+            with open(os.path.join(BATON, "local.json")) as f:
+                _config = json.load(f)
+        except (OSError, ValueError):
+            _config = {}
+    return _config
+
+
+def save_config(cfg):
+    import json
+    global _config
+    _config = cfg
+    write(os.path.join(BATON, "local.json"), json.dumps(cfg, indent=2) + "\n")
+
+
+def write(path, text):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
+        f.write(text)
+    try:
+        os.chmod(tmp, os.stat(path).st_mode & 0o7777)  # keep the file's permissions
+    except OSError:
+        pass
+    os.replace(tmp, path)
+
+
+def read(path, default=""):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    except (OSError, UnicodeDecodeError):
+        return default
+
+
+def accounts():
+    """[(name, folder)] in the order they were added."""
+    return [(n, os.path.expanduser(d)) for n, d in config().get("accounts", {}).items()]
+
+
+def features():
+    f = config().get("features", {})
+    return {"handoff": f.get("handoff", True), "statusline": f.get("statusline", True)}
+
+
+def threshold():
+    return float(os.environ.get("BATON_THRESHOLD") or config().get("threshold", 95))
+
+
+def current():
+    """The account folder of the Claude Code session that started us."""
+    return os.path.realpath(os.path.expanduser(os.environ.get("CLAUDE_CONFIG_DIR") or "~/.claude"))
+
+
+def same(a, b):
+    return os.path.realpath(a) == os.path.realpath(b)
+
+
+def is_default(d):
+    return same(d, os.path.join(HOME, ".claude"))
+
+
+def name_of(d):
+    for n, ad in accounts():
+        if same(ad, d):
+            return n
+    return tilde(d)
+
+
+def tilde(path):
+    return "~" + path[len(HOME):] if path == HOME or path.startswith(HOME + os.sep) else path
+
+
+def cache_file(d, kind="usage"):
+    """usage: the last reading. ok: exists while the account is under the threshold; the hook command checks its
+    age in shell and starts Python only when it's missing or older than FRESH."""
+    return os.path.join(CACHE, kind + os.path.realpath(d).replace(os.sep, "%"))
+
+
+def usage(d, max_age=FRESH):
+    """{at, five, five_reset, week, week_reset} or {at, error}; read at most every max_age seconds."""
+    import json
+    try:
+        with open(cache_file(d)) as f:
+            u = json.load(f)
+        if time.time() - u["at"] < max_age:
+            return u
+    except (OSError, ValueError, KeyError):
+        pass
+    return fetch(d)
+
+
+def fetch(d):
+    import json
+    u = read_usage(d)
+    os.makedirs(CACHE, exist_ok=True)
+    write(cache_file(d), json.dumps(u))
+    pct = level(u)[0]
+    if pct is not None and pct < threshold():
+        open(cache_file(d, "ok"), "w").close()
+    elif os.path.exists(cache_file(d, "ok")):
+        os.remove(cache_file(d, "ok"))
+    return u
+
+
+def read_usage(d):
+    import json
+    import urllib.error
+    import urllib.request
+    u = {"at": time.time()}
+    try:
+        req = urllib.request.Request(USAGE_URL, headers={
+            "Authorization": "Bearer " + token(d), "anthropic-beta": "oauth-2025-04-20",
+            "User-Agent": "baton/" + VERSION})
+        class NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, *args, **kwargs):
+                return None  # a redirect would carry the token to another host: stop (reported as HTTP 3xx)
+
+        data = json.load(urllib.request.build_opener(NoRedirect).open(req, timeout=6))
+        for key, window in (("five", "five_hour"), ("week", "seven_day")):
+            w = data.get(window) or {}
+            u[key], u[key + "_reset"] = w.get("utilization"), epoch(w.get("resets_at"))
+    except LookupError:
+        u["error"] = "not signed in"
+    except urllib.error.HTTPError as e:
+        u["error"] = "sign-in expired: open this account once" if e.code == 401 else f"HTTP {e.code}"
+    except Exception:
+        u["error"] = "offline"
+    return u
+
+
+def token(d):
+    """The account's Claude Code access token: .credentials.json, or the macOS Keychain. Never printed."""
+    import json
+    try:
+        with open(os.path.join(d, ".credentials.json")) as f:
+            return json.load(f)["claudeAiOauth"]["accessToken"]
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    if sys.platform == "darwin":
+        import hashlib
+        import subprocess
+        # Claude Code names the item after a hash of CLAUDE_CONFIG_DIR for any folder but the default one
+        names = ["Claude Code-credentials"] if is_default(d) else [
+            "Claude Code-credentials-" + hashlib.sha256(p.encode()).hexdigest()[:8]
+            for p in dict.fromkeys([d, os.path.realpath(d)])]
+        for n in names:
+            r = subprocess.run(["security", "find-generic-password", "-s", n, "-w"], capture_output=True, text=True)
+            if r.returncode == 0:
+                try:
+                    return json.loads(r.stdout)["claudeAiOauth"]["accessToken"]
+                except (ValueError, KeyError, TypeError):
+                    pass
+    raise LookupError(d)
+
+
+def signed_in(d):
+    """Whether the account has a sign-in, without reading the secret itself (no Keychain prompt on macOS)."""
+    if os.path.exists(os.path.join(d, ".credentials.json")):
+        return True
+    if sys.platform == "darwin":
+        import hashlib
+        import subprocess
+        names = ["Claude Code-credentials"] if is_default(d) else [
+            "Claude Code-credentials-" + hashlib.sha256(p.encode()).hexdigest()[:8]
+            for p in dict.fromkeys([d, os.path.realpath(d)])]
+        return any(subprocess.run(["security", "find-generic-password", "-s", n], capture_output=True).returncode == 0
+                   for n in names)
+    return False
+
+
+def epoch(iso):
+    if not iso:
+        return None
+    import datetime
+    import re
+    try:  # Python 3.8 can't read "Z" or more than 6 decimals
+        iso = re.sub(r"(\.\d{6})\d+", r"\1", iso.replace("Z", "+00:00"))
+        return datetime.datetime.fromisoformat(iso).timestamp()
+    except ValueError:
+        return None
+
+
+def level(u):
+    """The tighter of the two limits: (percent or None, window name, reset time)."""
+    best = (None, None, None)
+    for key, window in (("five", "5-hour"), ("week", "weekly")):
+        p = u.get(key)
+        if p is not None and (best[0] is None or float(p) > best[0]):
+            best = (float(p), window, u.get(key + "_reset"))
+    return best
+
+
+def roomiest(exclude=None):
+    """(name, folder, percent) of the account with the most room under the threshold; one whose usage can't be
+    read comes after every readable one; None when every account is over."""
+    th, best, unread = threshold(), None, None
+    for name, d in accounts():
+        if exclude and same(d, exclude):
+            continue
+        pct = level(usage(d))[0]
+        if pct is None:
+            unread = unread or (name, d, None)
+        elif pct < th and (best is None or pct < best[2]):
+            best = (name, d, pct)
+    return best or unread
+
+
+def soonest_reset(exclude=None):
+    times = [(level(usage(d))[2], n) for n, d in accounts() if not (exclude and same(d, exclude))]
+    times = [t for t in times if t[0]]
+    return min(times) if times else None
+
+
+def clock(ts, with_day=False):
+    if not ts:
+        return ""
+    fmt = "%a %H:%M" if with_day and ts - time.time() > 20 * 3600 else "%H:%M"
+    return time.strftime(fmt, time.localtime(ts))
+
+
+# ---------------------------------------------------------------- hooks
+
+def read_event():
+    import json
+    try:
+        return json.load(sys.stdin)
+    except ValueError:
+        return {}
+
+
+def emit(event_name, context, status=None):
+    import json
+    out = {"hookSpecificOutput": {"hookEventName": event_name, "additionalContext": context}}
+    if status:
+        out["systemMessage"] = status
+    print(json.dumps(out))
+
+
+def cli():
+    """How to call this script in text Claude or the user will run."""
+    import shutil
+    found = shutil.which("baton")
+    return "baton" if found and same(found, SCRIPT) else quote(SCRIPT)
+
+
+def redact(text):
+    """Hide a password or token inside a URL (https://user:secret@host)."""
+    import re
+    return re.sub(r"(://)[^/@\s]+@", r"\1***@", text)
+
+
+def quote(s):
+    import shlex
+    return shlex.quote(s)
+
+
+def hook_usage():
+    """UserPromptSubmit and PostToolUse: near the limit, tell Claude to write HANDOFF.md and move on."""
+    d = current()
+    pct, window, _ = level(usage(d))
+    th = threshold()
+    if pct is None or pct < th:
+        return  # the usual path: one small file read
+    event = read_event()
+    marker = os.path.join(CACHE, "reminded-" + str(event.get("session_id") or "none").replace(os.sep, "_"))
+    try:
+        if time.time() - os.path.getmtime(marker) < REMIND:
+            return
+    except OSError:
+        pass
+    os.makedirs(CACHE, exist_ok=True)
+    open(marker, "w").close()
+    cwd, me = event.get("cwd") or os.getcwd(), name_of(d)
+    steps = (f"USAGE HANDOFF (baton, the user's standing rule): {me} is at {pct:.0f}% of its {window} limit (handoff "
+             f"at {th:.0f}%). Before anything else: 1) finish only the edit in progress; 2) write or update HANDOFF.md "
+             f"in {cwd} so a fresh session can carry on with nothing else: goal, decisions, done, in progress (exact "
+             f"files, commands, running jobs), next steps; 3) stop your background agents and jobs; ")
+    nxt = roomiest(exclude=d)
+    if nxt:
+        status = f"{me} at {pct:.0f}%: handing off to {nxt[0]}"
+        context = steps + (f"4) run `cd {quote(cwd)} && {cli()} next --window`: it opens {nxt[0]} in a new terminal there with "
+                           f"\"{PROMPT}\" (if it can't open a window, give the user the command it prints); 5) tell "
+                           f"the user in one line that the work moved to {nxt[0]}, then stop.")
+    else:
+        soon = soonest_reset(exclude=d)
+        when = f"; the first to reset is {soon[1]} at {clock(soon[0], True)}" if soon else ""
+        status = f"{me} at {pct:.0f}%: every account is near its limit"
+        context = steps + f"4) every account is near its limit{when}. Tell the user in one line, then stop."
+    emit(event.get("hook_event_name") or "PostToolUse", context, status)
+
+
+def hook_start():
+    """SessionStart on this machine: pull the shared repo; say what changed elsewhere and what needs tidying."""
+    if os.environ.get("CLAUDE_CODE_REMOTE") == "true" or not is_repo():
+        return
+    read_event()
+    before = rev("HEAD")
+    sync(push=True, wait=30)
+    notes = []
+    target = upstream()
+    if before and target and rev("HEAD") != before:
+        base = git("merge-base", before, target).stdout.strip()
+        changed = git("diff", "--name-only", base, target).stdout.split() if base else []
+        if changed:
+            notes.append(f"Shared files changed on another machine (in {tilde(BATON)}); this session may have loaded "
+                         f"the old ones. Read the ones your task touches:\n" + "\n".join("  " + c for c in changed))
+    notes += tidy_notes()
+    if notes:
+        emit("SessionStart", "\n\n".join(notes))
+
+
+def hook_stop():
+    """Stop (runs async): commit and push the shared repo when something changed."""
+    if os.environ.get("CLAUDE_CODE_REMOTE") == "true" or not is_repo():
+        return
+    if needs_sync():
+        sync(push=True, wait=0)
+
+
+def hook_cloud_start():
+    """SessionStart in a Claude Code cloud session opened on the baton repo (its .claude/settings.json)."""
+    if os.environ.get("CLAUDE_CODE_REMOTE") != "true":
+        return
+    read_event()
+    root = os.environ.get("CLAUDE_PROJECT_DIR") or os.path.dirname(os.path.dirname(SCRIPT))
+    if not os.path.lexists(BATON):
+        os.symlink(root, BATON)
+    sync(push=False, wait=30)
+    index = read(os.path.join(BATON, "memory", "MEMORY.md"))
+    notes = [f"Cloud session on the baton repo: shared memory is {tilde(BATON)}/memory (this repo's memory/). Save "
+             f"lasting facts there; every reply is committed and pushed, so the user's other machines and accounts "
+             f"get them.\n\nMemory index (memory/MEMORY.md):\n{index}"] + tidy_notes()
+    emit("SessionStart", "\n\n".join(notes))
+
+
+def hook_cloud_stop():
+    if os.environ.get("CLAUDE_CODE_REMOTE") == "true" and is_repo() and needs_sync():
+        sync(push=True, wait=0)
+
+
+def tidy_notes():
+    """Clashes a sync merged, other sides it saved, and a memory index that's too long or missing files."""
+    import re
+    notes = []
+    secrets_log = os.path.join(BATON, ".git", "baton-secrets")
+    secret = sorted(set(read(secrets_log).split("\n")) - {""})
+    if secret:
+        os.remove(secrets_log)
+        notes.append(f"Not synced, because they look like they hold a secret (a key, token or password); they stay on "
+                     f"this computer only. Tell the user. A new file that holds no secret: remove its line from "
+                     f"{tilde(BATON)}/.git/info/exclude:\n" + "\n".join("  " + x for x in secret))
+    notice_log = os.path.join(BATON, ".git", "baton-notice")
+    told = sorted(set(read(notice_log).split("\n")) - {""})
+    if told:
+        os.remove(notice_log)
+        notes += told
+    merged_log = os.path.join(BATON, ".git", "baton-merged")
+    merged = sorted(set(read(merged_log).split("\n")) - {""})
+    if merged:
+        os.remove(merged_log)
+        notes.append("A sync merged a clash by keeping both sides' lines (nothing was lost). Check these files in "
+                     f"{tilde(BATON)} for doubled or contradicting lines and tidy them (newer wins only where they truly "
+                     "contradict):\n" + "\n".join("  " + m for m in merged))
+    others, memory_files = [], []
+    for top, dirs, files in os.walk(BATON):
+        dirs[:] = [x for x in dirs if x != ".git"]
+        for f in files:
+            rel = os.path.relpath(os.path.join(top, f), BATON)
+            if re.search(r"\.other(\.|$)", f):
+                others.append(rel)
+            elif rel.startswith("memory" + os.sep) and f.endswith(".md") and f != "MEMORY.md":
+                memory_files.append(rel[len("memory") + 1:])
+    if others:
+        notes.append("These files hold the other side of a clash that couldn't be merged line by line. Combine each "
+                     "with its original, then delete it:\n" + "\n".join("  " + o for o in others))
+    index = read(os.path.join(BATON, "memory", "MEMORY.md"))
+    lines = index.count("\n")
+    if lines > INDEX_LINES:
+        notes.append(f"memory/MEMORY.md is {lines} lines; Claude Code loads only the first {INDEX_LINES}. Shorten it "
+                     "(one short line per memory) when you next save to memory.")
+    missing = [m for m in memory_files if m not in index]
+    if missing:
+        notes.append("Memory files missing from MEMORY.md (add one line each, or delete them if they're stale):\n"
+                     + "\n".join("  " + m for m in missing[:20]))
+    return notes
+
+
+# ---------------------------------------------------------------- git sync
+
+_who = None
+
+
+def git(*args, timeout=60, cwd=None):
+    import subprocess
+    global _who
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+    env.setdefault("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")
+    if args and args[0] in ("commit", "rebase", "merge"):
+        args = ("-c", "commit.gpgsign=false") + args  # a background sync can't answer a signing prompt
+        if _who is None:  # commits need a name; a fresh machine or cloud box may have none
+            r = subprocess.run(["git", "config", "user.email"], cwd=cwd or BATON, capture_output=True, text=True)
+            _who = {} if r.stdout.strip() else {f"GIT_{k}_{f}": v for k in ("AUTHOR", "COMMITTER")
+                                                 for f, v in (("NAME", "baton"), ("EMAIL", "baton@localhost"))}
+        env = {**_who, **env}
+    try:
+        return subprocess.run(["git", *args], cwd=cwd or BATON, capture_output=True, text=True, timeout=timeout, env=env)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return subprocess.CompletedProcess(args, 124, "", str(e))
+
+
+def is_repo():
+    return os.path.isdir(os.path.join(BATON, ".git"))
+
+
+def rev(ref):
+    r = git("rev-parse", "--verify", "-q", ref)
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def branch():
+    """The branch the shared repo syncs: the remote's default (a cloud session may sit on its own branch)."""
+    r = git("symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD")
+    if r.returncode == 0 and r.stdout.strip():
+        return r.stdout.strip().split("/", 1)[1]
+    r = git("symbolic-ref", "-q", "--short", "HEAD")
+    return r.stdout.strip() or "main"
+
+
+def upstream():
+    ref = "origin/" + branch()
+    return ref if rev(ref) else None
+
+
+def has_remote():
+    return bool(git("remote").stdout.split())
+
+
+def needs_sync():
+    """Local edits, or commits the remote doesn't have."""
+    if git("status", "--porcelain").stdout.strip():
+        return True
+    target = upstream()
+    if not target:
+        return has_remote()
+    return git("merge-base", "--is-ancestor", "HEAD", target).returncode != 0
+
+
+def ensure_merge_driver():
+    want = f"{quote(sys.executable)} {quote(SCRIPT)} merge %O %A %B %P"
+    if git("config", "--get", "merge.baton.driver").stdout.strip() != want:
+        git("config", "merge.baton.name", "baton: keep both sides")
+        git("config", "merge.baton.driver", want)
+
+
+SECRET_NAME = r"(^|/)(\.env(\.[^/]*)?|[^/]*\.(pem|key|p12|pfx)|id_(rsa|dsa|ecdsa|ed25519)|\.?credentials\.json|\.netrc)$"
+SECRET_TEXT = (r"sk-ant-[\w-]{20,}|sk-[A-Za-z0-9]{32,}|gh[pousr]_[A-Za-z0-9]{30,}|github_pat_\w{30,}|AKIA[0-9A-Z]{16}"
+               r"|AIza[\w-]{35}|xox[abprs]-[\w-]{10,}|-----BEGIN [A-Z ]*PRIVATE KEY-----"
+               r"|(?i:(api[_-]?key|secret|token|passw(or)?d)[\"']?\s*[:=]\s*[\"']?[\w/+=]{20,})")
+
+
+def keep_secrets_out():
+    """Unstage files that look like they hold a secret, keep them out of git from now on, and note them: the repo
+    syncs to a remote, and history can't be taken back."""
+    import re
+    # --no-renames: a file renamed and edited in one go shows as added, so it's checked too
+    r = git("diff", "--cached", "--name-only", "-z", "--no-renames", "--diff-filter=AMT")
+    if r.returncode != 0:
+        return False  # couldn't check: the caller commits nothing
+    names = r.stdout.split("\0")
+    found = []
+    for f in filter(None, names):
+        if f == ".baton/baton":
+            continue
+        bad = re.search(SECRET_NAME, f)
+        if not bad:
+            try:
+                with open(os.path.join(BATON, f), encoding="utf-8", errors="replace") as fh:
+                    bad = re.search(SECRET_TEXT, fh.read(4_000_000))  # the first 4 MB of even a big file
+            except OSError:
+                pass
+        if bad:
+            found.append(f)
+    if not found:
+        return True
+    # synced before: the repo keeps its last clean version (deleting it would delete it on every other machine)
+    held = [f for f in found if git("cat-file", "-e", f"HEAD:{f}").returncode == 0]
+    new = [f for f in found if f not in held]
+    if held:
+        git("reset", "-q", "--", *held)
+    if new:
+        git("rm", "--cached", "-q", "--", *new)
+        os.makedirs(os.path.join(BATON, ".git", "info"), exist_ok=True)
+        with open(os.path.join(BATON, ".git", "info", "exclude"), "a") as out:
+            out.write("".join(f"/{f}\n" for f in new))
+    with open(os.path.join(BATON, ".git", "baton-secrets"), "a") as out:
+        out.write("".join(f"{f} (new: kept out of git)\n" for f in new)
+                  + "".join(f"{f} (synced before: its last clean version stays synced; this change stays here until the "
+                            f"secret is taken out of the file)\n" for f in held))
+    return True
+
+
+def commit_all():
+    git("add", "-A")
+    if not keep_secrets_out():
+        git("reset", "-q")
+        return False
+    if git("diff", "--cached", "--quiet").returncode == 0:
+        return False
+    where = ("cloud" if os.environ.get("CLAUDE_CODE_REMOTE") == "true"
+             else config().get("machine") or ("mac" if sys.platform == "darwin" else "linux"))
+    git("commit", "-q", "-m", f"baton: {where} {time.strftime('%Y-%m-%d %H:%M', time.gmtime())} UTC")
+    return True
+
+
+def unstick():
+    """A rebase or merge left half done (git was killed mid-sync, or someone is merging by hand). False while it's
+    under 10 minutes old: sync then commits nothing, so nothing lands on a half-done state. After that: set the
+    edits aside (and save them as a patch in .git), undo it, and bring the edits back."""
+    for state in ("rebase-merge", "rebase-apply", "MERGE_HEAD"):
+        p = os.path.join(BATON, ".git", state)
+        if not os.path.exists(p):
+            continue
+        if time.time() - os.path.getmtime(p) < 600:
+            return False
+        import shutil
+        stamp = time.strftime("baton-undone-%Y%m%d-%H%M%S")
+        patch = os.path.join(BATON, ".git", stamp + ".patch")
+        diff = git("diff", "HEAD").stdout
+        write(patch, diff)
+        # the clashing files: their working copies (maybe resolved by hand) are kept in .git/<stamp>/, then they go
+        # back to the half-done state's own version (the undo restores this side's) so the stash takes every other edit
+        unmerged = list(filter(None, git("diff", "--name-only", "--diff-filter=U", "-z").stdout.split("\0")))
+        for f in unmerged:
+            src = os.path.join(BATON, f)
+            if os.path.isfile(src):
+                os.makedirs(os.path.dirname(os.path.join(BATON, ".git", stamp, f)), exist_ok=True)
+                shutil.copy2(src, os.path.join(BATON, ".git", stamp, f))
+            if git("checkout", "-q", "HEAD", "--", f).returncode != 0:
+                git("rm", "-q", "--cached", "--", f)
+        if unmerged:
+            notice(f"A sync that got stuck mid-merge was undone. The files it was merging ({', '.join(unmerged)}) are "
+                   f"back to this computer's version; the half-merged copies are kept in {tilde(BATON)}/.git/{stamp}/. "
+                   f"If someone had fixed them by hand, copy the fix back.")
+        stashed = set_aside()
+        if git("rebase", "--abort").returncode != 0 and git("merge", "--abort").returncode != 0:
+            git("reset", "-q", "--merge")
+        bring_back(stashed)
+        if diff.strip() and not stashed and git("apply", "--3way", patch).returncode != 0:
+            notice(f"Edits made while a sync was stuck couldn't be put back by themselves; they're saved in "
+                   f"{tilde(patch)}. Apply them (git apply --3way) or copy the lines in by hand.")
+        break
+    return True
+
+
+def set_aside():
+    """Stash uncommitted edits to tracked files (held secrets, edits during a stuck merge). True if any were."""
+    if not git("status", "--porcelain", "--untracked-files=no").stdout.strip():
+        return False
+    before = rev("refs/stash")
+    git("stash", "push", "-q", "-m", "baton: set aside during sync")
+    return rev("refs/stash") != before
+
+
+def bring_back(stashed):
+    if stashed and git("stash", "pop", "-q").returncode != 0:
+        git("reset", "-q", "--merge")  # the edit clashed with the remote's; it stays safe in the stash
+        notice(f"An edit clashed with the remote's version and is kept in {tilde(BATON)}'s git stash "
+               f"(`git stash show -p`); put it back by hand, then `git stash drop`.")
+
+
+def notice(text):
+    with open(os.path.join(BATON, ".git", "baton-notice"), "a") as out:
+        out.write(text.replace("\n", " ") + "\n")
+
+
+def integrate(target):
+    """Bring the remote in: a rebase when it applies (text clashes merge themselves through the merge driver),
+    else a merge that keeps this side of anything left and saves the other side next to it as NAME.other.EXT."""
+    if git("merge-base", "--is-ancestor", target, "HEAD").returncode == 0:
+        return True
+    if git("rebase", "-q", target).returncode == 0:
+        return True
+    git("rebase", "--abort")
+    if git("merge", "-q", "--no-edit", target).returncode == 0:
+        return True
+    unmerged = git("diff", "--name-only", "--diff-filter=U", "-z").stdout.split("\0")
+    for f in filter(None, unmerged):
+        if git("cat-file", "-e", f":2:{f}").returncode == 0:
+            git("checkout", "--ours", "--", f)
+            import subprocess
+            theirs = subprocess.run(["git", "show", f":3:{f}"], cwd=BATON, capture_output=True)  # bytes: may be binary
+            if theirs.returncode == 0:
+                stem, ext = os.path.splitext(f)
+                with open(os.path.join(BATON, f"{stem}.other{ext}"), "wb") as out:
+                    out.write(theirs.stdout)
+        else:  # deleted here, changed there: keep the changed file
+            git("checkout", "--theirs", "--", f)
+        log_merged(f)
+    git("add", "-A")
+    if keep_secrets_out() and git("commit", "-q", "--no-edit").returncode == 0:
+        return True
+    git("merge", "--abort")
+    return False
+
+
+def sync(push=True, wait=0):
+    """Commit, bring in the remote, push. Never blocks other syncs (one at a time) and never loses work."""
+    if not is_repo():
+        return "no shared repo: run `baton init`"
+    import fcntl
+    lock = open(os.path.join(BATON, ".git", "baton.lock"), "w")
+    deadline = time.time() + wait
+    while True:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except OSError:
+            if time.time() >= deadline:
+                return "another sync is running"
+            time.sleep(0.2)
+    try:
+        ensure_merge_driver()
+        refresh_vendored()
+        if not unstick():
+            return "a merge is in progress; the next sync tries again"
+        commit_all()
+        if not has_remote():
+            return "saved (no remote yet: `baton init --remote URL`)"
+        b = branch()
+        for attempt in range(3):
+            if git("fetch", "-q", "origin", timeout=30).returncode != 0:
+                return "saved here; couldn't reach the remote"
+            target = upstream()
+            stashed = set_aside() if target else False
+            merged = integrate(target) if target else True
+            bring_back(stashed)
+            if not merged:
+                return "saved here; couldn't merge with the remote (left for the next sync)"
+            if not push:
+                return "pulled"
+            if target and rev("HEAD") == rev(target):
+                return "in sync"
+            if git("push", "-q", "origin", f"HEAD:refs/heads/{b}", timeout=60).returncode == 0:
+                if not target:
+                    git("branch", "-q", "--set-upstream-to", f"origin/{b}")
+                return "in sync"
+            time.sleep(attempt + 1)  # someone pushed in between: fetch and merge again
+        return "saved here; push failed (the next sync retries)"
+    finally:
+        lock.close()
+
+
+def log_merged(path):
+    with open(os.path.join(BATON, ".git", "baton-merged"), "a") as f:
+        f.write(path + "\n")
+
+
+# ---------------------------------------------------------------- merge driver (keeps both sides)
+
+def cmd_merge(args):
+    """git merge driver: baton merge BASE OURS THEIRS PATH. Writes OURS; exit 1 leaves the clash to sync()."""
+    base_p, ours_p, theirs_p, path = args[:4]
+    try:
+        ours, base, theirs = (open(p, encoding="utf-8", newline="").read() for p in (ours_p, base_p, theirs_p))
+    except (UnicodeDecodeError, OSError):
+        return 1
+    if "\0" in ours + base + theirs:
+        return 1  # binary, even when its bytes happen to read as text: never mix lines
+    if path == ".baton/baton":  # the cloud copy of baton: the newer version wins, never a mix
+        if version_of(theirs) > version_of(ours):
+            with open(ours_p, "w", encoding="utf-8", newline="") as f:
+                f.write(theirs)
+        return 0
+    result = "".join(union(lines(base), lines(ours), lines(theirs)))
+    if ours and not ours.endswith("\n") and result.endswith("\n"):
+        result = result[:-1]
+    if path.endswith(".json"):
+        import json
+        try:
+            json.loads(result)
+        except ValueError:
+            return 1
+    if path.endswith(".py"):
+        try:
+            compile(result, path, "exec")
+        except (SyntaxError, ValueError):
+            return 1
+    with open(ours_p, "w", encoding="utf-8", newline="") as f:
+        f.write(result)
+    if ours != theirs:
+        try:
+            log_merged(path)
+        except OSError:
+            pass
+    return 0
+
+
+def lines(text):
+    return [x if x.endswith("\n") else x + "\n" for x in text.splitlines(True)]
+
+
+def changes(base, side):
+    import difflib
+    ops = difflib.SequenceMatcher(None, base, side, autojunk=False).get_opcodes()
+    return [(i1, i2, side[j1:j2]) for tag, i1, i2, j1, j2 in ops if tag != "equal"]
+
+
+def version(base, lo, hi, side_changes):
+    out, i = [], lo
+    for i1, i2, new in side_changes:
+        out += base[i:i1] + new
+        i = i2
+    return out + base[i:hi]
+
+
+def keep_both(x, y):
+    import difflib
+    if x == y:
+        return x
+    out = []
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, x, y, autojunk=False).get_opcodes():
+        out += x[i1:i2] if tag == "equal" else x[i1:i2] + y[j1:j2]
+    return out
+
+
+def union(base, ours, theirs):
+    """Three-way merge that applies every change from both sides. Where both changed the same lines (or added
+    lines at the same spot) this side's lines come first, then the other's, shared lines once. Unlike
+    `git merge-file --union`, clashes a few lines apart stay separate, so lines between them aren't doubled."""
+    a, b = changes(base, ours), changes(base, theirs)
+    out, i, ia, ib = [], 0, 0, 0
+    clash = lambda c, d: (c[0] < d[1] and d[0] < c[1]) or (c[0] == c[1] == d[0] == d[1])
+    while ia < len(a) or ib < len(b):
+        ca = a[ia] if ia < len(a) else None
+        cb = b[ib] if ib < len(b) else None
+        if ca and cb and clash(ca, cb):
+            ga, gb = [ca], [cb]
+            lo, hi = min(ca[0], cb[0]), max(ca[1], cb[1])
+            ia, ib, grew = ia + 1, ib + 1, True
+            while grew:
+                grew = False
+                if ia < len(a) and a[ia][0] < hi:
+                    ga.append(a[ia]); hi = max(hi, a[ia][1]); ia += 1; grew = True  # noqa: E702
+                if ib < len(b) and b[ib][0] < hi:
+                    gb.append(b[ib]); hi = max(hi, b[ib][1]); ib += 1; grew = True  # noqa: E702
+            out += base[i:lo] + keep_both(version(base, lo, hi, ga), version(base, lo, hi, gb))
+            i = hi
+            continue
+        if cb is None or (ca is not None and ca[:2] <= cb[:2]):
+            change, ia = ca, ia + 1
+        else:
+            change, ib = cb, ib + 1
+        out += base[i:change[0]] + change[2]
+        i = change[1]
+    return out + base[i:]
+
+
+# ---------------------------------------------------------------- setting up accounts
+
+CLAUDE_MD = """# Shared rules
+
+Every Claude Code account on this computer reads this file (each account's CLAUDE.md links here), and so does a
+cloud session opened on this repo. Write your rules for Claude here.
+
+## baton
+- Several Claude accounts work as one: this file, memory (~/.baton/memory), agents, skills and commands are shared
+  and synced with git.
+- Work in progress lives in the project's HANDOFF.md: goal, decisions, done, in progress, next steps. Keep it current
+  on long tasks; when the user says "continue", read it first.
+"""
+
+REPO_README = """# My Claude (baton)
+
+Shared rules (`CLAUDE.md`), memory (`memory/`), agents, skills and commands for all my Claude Code accounts,
+kept in sync by [baton](https://github.com/NikhilDhaliya/baton). Keep this repo private.
+"""
+
+CLOUD_SETTINGS = """{
+  "autoMemoryDirectory": "~/.baton/memory",
+  "hooks": {
+    "SessionStart": [
+      {"hooks": [{"type": "command", "command": "python3 \\"$CLAUDE_PROJECT_DIR/.baton/baton\\" hook cloud-start", "timeout": 60}]}
+    ],
+    "Stop": [
+      {"hooks": [{"type": "command", "command": "python3 \\"$CLAUDE_PROJECT_DIR/.baton/baton\\" hook cloud-stop", "async": true}]}
+    ]
+  }
+}
+"""
+
+SKELETON = {
+    "CLAUDE.md": CLAUDE_MD,
+    "README.md": REPO_README,
+    "memory/MEMORY.md": "# Memory\n\nOne line per memory file: - [Title](file.md) — what it says.\n",
+    ".gitattributes": "* merge=baton\n",
+    ".gitignore": "local.json\n.DS_Store\n.env\n.env.*\n*.pem\n*.key\n",
+    ".claude/settings.json": CLOUD_SETTINGS,
+    **{f"{s}/.gitkeep": "" for s in SHARED},
+}
+
+
+def scaffold():
+    for rel, text in SKELETON.items():
+        p = os.path.join(BATON, rel)
+        if not os.path.exists(p):
+            write(p, text)
+    refresh_vendored()
+
+
+def refresh_vendored():
+    """Keep a copy of this script in the repo, for cloud sessions (they don't have baton installed)."""
+    copy = os.path.join(BATON, ".baton", "baton")
+    if same(copy, SCRIPT):
+        return
+    mine, theirs = read(SCRIPT), read(copy)
+    if mine and mine != theirs and (not theirs or version_of(mine) > version_of(theirs)):
+        write(copy, mine)
+        os.chmod(copy, 0o755)
+
+
+def version_of(text):
+    import re
+    m = re.search(r'^VERSION = "([0-9.]+)"', text, re.M)
+    return tuple(int(x) for x in m.group(1).split(".")) if m else (0,)
+
+
+def hook_specs(d):
+    c = quote(SCRIPT)
+    # after every tool call: a shell check of the ok file (~3 ms) instead of starting Python (~50 ms)
+    usage_cmd = f'[ -n "$(find {quote(cache_file(d, "ok"))} -mmin -{FRESH // 60} 2>/dev/null)" ] || exec {c} hook usage'
+    specs = {
+        "SessionStart": {"hooks": [{"type": "command", "command": f"{c} hook start", "timeout": 60}]},
+        "UserPromptSubmit": {"hooks": [{"type": "command", "command": usage_cmd, "timeout": 15}]},
+        "PostToolUse": {"matcher": "*", "hooks": [{"type": "command", "command": usage_cmd, "timeout": 15}]},
+        "Stop": {"hooks": [{"type": "command", "command": f"{c} hook stop", "async": True, "timeout": 120}]},
+    }
+    if not features()["handoff"]:
+        del specs["UserPromptSubmit"], specs["PostToolUse"]
+    return specs
+
+
+def ours(cmd):
+    return "baton" in cmd and any(w in cmd for w in (" hook start", " hook usage", " hook stop", " statusline"))
+
+
+def backup(path, d):
+    """Move a file, folder or link into <account>/baton-backup/ (never overwrites an older backup)."""
+    dest = os.path.join(d, "baton-backup", os.path.basename(path))
+    if os.path.lexists(dest):
+        dest += time.strftime(".%Y%m%d-%H%M%S")
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    os.rename(path, dest)
+    return dest
+
+
+def adopt_claude_md(d):
+    """Link the account's CLAUDE.md to the shared one; rules it had join the shared file first."""
+    p, shared = os.path.join(d, "CLAUDE.md"), os.path.join(BATON, "CLAUDE.md")
+    if os.path.islink(p) and same(p, shared):
+        return None
+    note = None
+    if os.path.lexists(p):
+        text = read(p).strip()
+        mine = read(shared)
+        if text and text not in mine:
+            if mine.strip() == CLAUDE_MD.strip():
+                write(shared, text + "\n\n" + CLAUDE_MD[CLAUDE_MD.index("## baton"):])
+            else:
+                write(shared, mine.rstrip() + f"\n\n<!-- from {tilde(p)} -->\n{text}\n")
+            note = f"its CLAUDE.md rules moved into {tilde(shared)}"
+        backup(p, d)
+    os.symlink(shared, p)
+    return note
+
+
+def adopt_dir(d, sub):
+    """Link <account>/<sub> to the shared folder; what it held is copied in first (name clashes stay in the backup)."""
+    import shutil
+    p, shared = os.path.join(d, sub), os.path.join(BATON, sub)
+    os.makedirs(shared, exist_ok=True)
+    if os.path.islink(p) and same(p, shared):
+        return []
+    clashes = []
+    if os.path.lexists(p):
+        src = os.path.realpath(p)
+        if os.path.isdir(src):
+            for entry in os.listdir(src):
+                a, b = os.path.join(src, entry), os.path.join(shared, entry)
+                if os.path.lexists(b):
+                    if not (os.path.isfile(a) and read(a) == read(b)):
+                        clashes.append(f"{sub}/{entry}")
+                elif os.path.isdir(a) and not os.path.islink(a):
+                    shutil.copytree(a, b, symlinks=True)
+                else:
+                    shutil.copy2(a, b, follow_symlinks=False)
+        backup(p, d)
+    os.symlink(shared, p)
+    return clashes
+
+
+def wire_settings(d):
+    import json
+    p = os.path.join(d, "settings.json")
+    try:
+        s = json.loads(read(p) or "{}")
+    except ValueError:
+        raise SystemExit(f"baton: {tilde(p)} isn't valid JSON; fix it and run again")
+    if os.path.exists(p) and not os.path.exists(os.path.join(d, "baton-backup", "settings.json")):
+        import shutil
+        os.makedirs(os.path.join(d, "baton-backup"), exist_ok=True)
+        shutil.copy2(p, os.path.join(d, "baton-backup", "settings.json"))
+    note = None
+    prev = s.get("autoMemoryDirectory")
+    if prev and not same(os.path.expanduser(prev), os.path.join(BATON, "memory")):
+        cfg = config()
+        cfg.setdefault("previous_memory", {})[tilde(d)] = prev
+        save_config(cfg)
+        note = f"its memory folder {prev} is no longer loaded (restored by `baton leave`); bring its notes into {tilde(BATON)}/memory"
+    s["autoMemoryDirectory"] = tilde(os.path.join(BATON, "memory"))
+    hooks = s.setdefault("hooks", {})
+    specs = hook_specs(d)
+    for event in set(hooks) | set(specs):
+        groups = hooks.setdefault(event, [])
+        for g in groups:
+            g["hooks"] = [h for h in g.get("hooks", []) if not ours(h.get("command", ""))]
+        groups[:] = [g for g in groups if g.get("hooks")] + ([specs[event]] if event in specs else [])
+        if not groups:
+            del hooks[event]
+    line = s.get("statusLine") or {}
+    if features()["statusline"] and (not line or ours(line.get("command", ""))):
+        s["statusLine"] = {"type": "command", "command": f"{quote(SCRIPT)} statusline"}
+    elif not features()["statusline"] and ours(line.get("command", "")):
+        del s["statusLine"]
+    write(os.path.realpath(p), json.dumps(s, indent=2) + "\n")  # through a link (dotfile managers)
+    return note
+
+
+def unwire_settings(d):
+    import json
+    p = os.path.join(d, "settings.json")
+    try:
+        s = json.loads(read(p) or "{}")
+    except ValueError:
+        return
+    if same(os.path.expanduser(s.get("autoMemoryDirectory", "")), os.path.join(BATON, "memory")):
+        s.pop("autoMemoryDirectory")
+        prev = config().get("previous_memory", {}).get(tilde(d))
+        if prev:
+            s["autoMemoryDirectory"] = prev
+    for event, groups in list(s.get("hooks", {}).items()):
+        for g in groups:
+            g["hooks"] = [h for h in g.get("hooks", []) if not ours(h.get("command", ""))]
+        s["hooks"][event] = [g for g in groups if g.get("hooks")]
+        if not s["hooks"][event]:
+            del s["hooks"][event]
+    if not s.get("hooks"):
+        s.pop("hooks", None)
+    if ours((s.get("statusLine") or {}).get("command", "")):
+        s.pop("statusLine")
+    write(os.path.realpath(p), json.dumps(s, indent=2) + "\n")
+
+
+def join(d, name):
+    d = os.path.abspath(os.path.expanduser(d))
+    os.makedirs(d, exist_ok=True)
+    notes = [n for n in [adopt_claude_md(d)] if n]
+    clashes = [c for sub in SHARED for c in adopt_dir(d, sub)]
+    if clashes:
+        notes.append("kept the shared copy of " + ", ".join(clashes) + f" (this account's are in {tilde(d)}/baton-backup)")
+    notes += [n for n in [wire_settings(d)] if n]
+    cfg = config()
+    cfg.setdefault("accounts", {})[name] = tilde(d)
+    save_config(cfg)
+    if not is_default(d):
+        notes += launcher(name, d)
+    return notes
+
+
+def launcher(name, d):
+    path = os.path.join(BIN, name)
+    if os.path.exists(path) and "baton launcher" not in read(path):
+        return [f"{tilde(path)} exists and isn't baton's, so start this account with: CLAUDE_CONFIG_DIR={tilde(d)} claude"]
+    folder = "$HOME" + d[len(HOME):] if d.startswith(HOME + os.sep) else d
+    write(path, f'#!/bin/sh\n# baton launcher: Claude Code on the account in {tilde(d)}\n'
+                'command -v claude >/dev/null 2>&1 || PATH="$PATH:$HOME/.local/bin:$HOME/.claude/local"\n'
+                f'CLAUDE_CONFIG_DIR="{folder}" exec claude "$@"\n')
+    os.chmod(path, 0o755)
+    return []
+
+
+# ---------------------------------------------------------------- launching the next account
+
+def find_claude():
+    import shutil
+    for c in (shutil.which("claude"), os.path.join(BIN, "claude"), os.path.join(HOME, ".claude", "local", "claude")):
+        if c and os.access(c, os.X_OK):
+            return c
+    raise SystemExit("baton: can't find the claude command")
+
+
+def clean_env(d):
+    """Our environment minus the running session's markers (a child session doesn't save its transcript)."""
+    env = {k: v for k, v in os.environ.items() if not (k == "CLAUDECODE" or k.startswith("CLAUDE_CODE_"))}
+    env.pop("CLAUDE_CONFIG_DIR", None)
+    if not is_default(d):
+        env["CLAUDE_CONFIG_DIR"] = d
+    return env
+
+
+def start_cmd(name, d):
+    """What a person would type to start this account."""
+    import shutil
+    if is_default(d):
+        return "claude"
+    if shutil.which(name) and "baton launcher" in read(shutil.which(name)):
+        return name
+    folder = '"$HOME' + d[len(HOME):] + '"' if d.startswith(HOME + os.sep) else quote(d)
+    return f"CLAUDE_CONFIG_DIR={folder} claude"
+
+
+def start_line(name, d, prompt):
+    return f"{start_cmd(name, d)} {quote(prompt)}"
+
+
+def open_window(cwd, inner, env):
+    """Run a shell command in a new terminal window (tmux, macOS Terminal/iTerm, or a Linux terminal)."""
+    import shutil
+    import subprocess
+
+    def spawn(argv):
+        try:
+            p = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL, start_new_session=True)
+        except OSError:
+            return False
+        try:
+            return p.wait(timeout=1.5) == 0
+        except subprocess.TimeoutExpired:
+            return True  # still running: the window is open
+
+    if os.environ.get("TMUX") and shutil.which("tmux"):
+        return spawn(["tmux", "new-window", "-c", cwd, inner])
+    if sys.platform == "darwin":
+        s = f"cd {quote(cwd)} && {inner}".replace("\\", "\\\\").replace('"', '\\"')
+        if os.environ.get("TERM_PROGRAM") == "iTerm.app":
+            script = ('tell application "iTerm"\nactivate\nset w to (create window with default profile)\n'
+                      f'tell current session of w to write text "{s}"\nend tell')
+        else:
+            script = f'tell application "Terminal"\nactivate\ndo script "{s}"\nend tell'
+        return spawn(["osascript", "-e", script])
+    run = ["/bin/sh", "-c", inner]
+    for t in linux_terminals():
+        if spawn([t, *TERMS.get(t, ["-e"]), *run]):
+            return True
+    return False
+
+
+TERMS = {"gnome-terminal": ["--"], "kitty": [], "wezterm": ["start", "--"], "alacritty": ["-e"], "ghostty": ["-e"],
+         "konsole": ["-e"], "foot": [], "xfce4-terminal": ["-x"], "xterm": ["-e"], "x-terminal-emulator": ["-e"]}
+
+
+def linux_terminals():
+    """Installed terminals to open a window with: the one we run in first (its variables reach Claude's shell),
+    then $TERMINAL, then the rest. Empty without a display."""
+    import shutil
+    if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        return []
+    here = [t for v, t in (("KITTY_WINDOW_ID", "kitty"), ("WEZTERM_PANE", "wezterm"), ("ALACRITTY_WINDOW_ID", "alacritty"),
+                           ("GHOSTTY_RESOURCES_DIR", "ghostty"), ("KONSOLE_VERSION", "konsole"),
+                           ("GNOME_TERMINAL_SCREEN", "gnome-terminal")) if os.environ.get(v)]
+    custom = os.environ.get("TERMINAL")
+    return [t for t in dict.fromkeys(here + ([custom] if custom else []) + list(TERMS)) if shutil.which(t)]
+
+
+def window_method():
+    import shutil
+    if os.environ.get("TMUX") and shutil.which("tmux"):
+        return "tmux"
+    if sys.platform == "darwin":
+        return "iTerm" if os.environ.get("TERM_PROGRAM") == "iTerm.app" else "Terminal"
+    found = linux_terminals()
+    return found[0] if found else None
+
+
+def cmd_next(args):
+    flags = {a for a in args if a.startswith("--")}
+    prompt = " ".join(a for a in args if not a.startswith("--")) or PROMPT
+    pick = roomiest()
+    if not pick:
+        soon = soonest_reset()
+        print("Every account is near its limit" + (f"; {soon[1]} resets first, at {clock(soon[0], True)}." if soon else "."))
+        return 1
+    name, d, pct = pick
+    cwd = os.getcwd()
+    line = f"cd {quote(cwd)} && {start_line(name, d, prompt)}"
+    if "--print" in flags:
+        print(line)
+        return 0
+    env, claude = clean_env(d), find_claude()
+    if "--window" in flags:
+        drop = " ".join(f"-u {k}" for k in sorted(os.environ) if k == "CLAUDECODE" or k.startswith("CLAUDE_CODE_"))
+        cfg = "-u CLAUDE_CONFIG_DIR" if is_default(d) else f"CLAUDE_CONFIG_DIR={quote(d)}"
+        inner = f'env {drop} {cfg} {quote(claude)} {quote(prompt)}; exec "${{SHELL:-/bin/sh}}"'
+        if open_window(cwd, inner, env):
+            print(f"Opened {name}" + (f" ({pct:.0f}% used)" if pct is not None else "") + f" in a new window, in {tilde(cwd)}.")
+            return 0
+        print(f"Couldn't open a terminal window. Run this in a terminal:\n  {line}")
+        return 2
+    print(f"baton: continuing on {name}" + (f" ({pct:.0f}% used)" if pct is not None else ""), file=sys.stderr)
+    os.execve(claude, [claude, prompt], env)
+
+
+# ---------------------------------------------------------------- scan (read-only, for Claude to plan a setup)
+
+def found_accounts():
+    """{folder: how it's started} for every Claude Code account folder on this computer."""
+    import glob
+    import re
+    starts = {}
+    for rc in (".bashrc", ".bash_aliases", ".zshrc", ".profile", ".bash_profile", ".zprofile", ".config/fish/config.fish"):
+        for line in read(os.path.join(HOME, rc)).splitlines():
+            m = re.search(r"CLAUDE_CONFIG_DIR=[\"']?([^\s\"';]+)", line)
+            if not m or line.lstrip().startswith("#"):
+                continue
+            d = os.path.realpath(os.path.expanduser(re.sub(r"\$\{?HOME\}?", HOME, m.group(1))))
+            a = re.search(r"(?:alias\s+|function\s+)([\w.-]+)|^\s*([\w.-]+)\s*\(\)", line)
+            starts.setdefault(d, []).append(f"`{a.group(1) or a.group(2)}` in ~/{rc}" if a else f"set in ~/{rc}")
+    for launcher_path in glob.glob(os.path.join(BIN, "claude?*")):
+        if os.path.getsize(launcher_path) > 4096:
+            continue  # the claude program itself, not a launcher
+        m = re.search(r'CLAUDE_CONFIG_DIR="([^"]+)"', read(launcher_path))
+        if m:
+            starts.setdefault(os.path.realpath(m.group(1).replace("$HOME", HOME)), []).insert(0, f"`{os.path.basename(launcher_path)}`")
+    env_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+    if env_dir:
+        starts.setdefault(os.path.realpath(os.path.expanduser(env_dir)), []).append("this session's CLAUDE_CONFIG_DIR")
+    candidates = [os.path.join(HOME, ".claude")] + sorted(glob.glob(os.path.join(HOME, ".claude-*"))) + list(starts)
+    out = {}
+    for d in candidates:
+        d = os.path.realpath(d)
+        looks = any(os.path.exists(os.path.join(d, x)) for x in (".credentials.json", "settings.json", "projects", ".claude.json", "history.jsonl"))
+        if os.path.isdir(d) and looks and d not in out:
+            out[d] = "`claude`" if is_default(d) else ", ".join(starts.get(d, [])) or "no command found"
+    return out
+
+
+def describe_link_or_count(d, item):
+    p = os.path.join(d, item)
+    if os.path.islink(p):
+        return f"{item} -> {tilde(os.path.realpath(p))}"
+    if item == "CLAUDE.md":
+        n = read(p).count("\n")
+        return f"CLAUDE.md {n} lines" if os.path.exists(p) else "no CLAUDE.md"
+    n = len([x for x in os.listdir(p) if not x.startswith(".")]) if os.path.isdir(p) else 0
+    return f"{item} {n}"
+
+
+def hooks_summary(s):
+    """Event(script name) for hooks that aren't baton's; never the full command (it could hold a secret)."""
+    import shlex
+    out = []
+    for event, groups in (s.get("hooks") or {}).items():
+        for g in groups:
+            for h in g.get("hooks", []):
+                cmd = h.get("command", "")
+                if ours(cmd):
+                    continue
+                try:
+                    words = shlex.split(cmd)
+                except ValueError:
+                    words = cmd.split()
+                paths = [w for w in words if "/" in w]
+                out.append(f"{event}({os.path.basename(paths[0] if paths else (words or ['?'])[0])})")
+    return out
+
+
+def cmd_scan(args):
+    import json
+    import platform
+    import re
+    import shutil
+    import subprocess
+
+    def run(*cmd):
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            return r.returncode, (r.stdout + r.stderr).strip()
+        except (OSError, subprocess.TimeoutExpired):
+            return 127, ""
+
+    print("baton scan: reads files on this computer only; changes nothing, sends nothing" if "--usage" not in args
+          else "baton scan --usage: also reads each account's usage from Anthropic with its sign-in", "\n")
+    osname = f"macOS {platform.mac_ver()[0]}" if sys.platform == "darwin" else f"{platform.system()} {platform.release()}"
+    git_v = run("git", "--version")[1].replace("git version ", "") or "MISSING"
+    claude_v = run("claude", "--version")[1].split(" ")[0] if shutil.which("claude") else None
+    print(f"system    {osname} · python {platform.python_version()} · git {git_v} · "
+          + (f"Claude Code {claude_v}" if claude_v else "`claude` command NOT on PATH (account commands and handoff need it)"))
+    if shutil.which("gh"):
+        rc, user = run("gh", "config", "get", "-h", "github.com", "user")  # local config only, no network
+        print("github    " + (f"gh signed in as {user} (init --github NAME can create the private repo)" if rc == 0 and user
+                                else "gh installed, not signed in (the user runs `gh auth login`, or gives a repo URL)"))
+    else:
+        print("github    gh not installed (sync needs a private repo URL from the user: init --remote URL)")
+    w = window_method()
+    print(f"windows   {'new terminal windows via ' + w if w else 'no window opener (handoff prints a command to paste)'}")
+    print(f"PATH      {tilde(BIN)} " + ("is on PATH" if BIN in os.environ.get("PATH", "").split(os.pathsep) else "is NOT on PATH"))
+    if is_repo():
+        remote = redact(git("remote", "get-url", "origin").stdout.strip()) or "no remote"
+        print(f"baton     set up: {tilde(BATON)} ({remote}); accounts: {', '.join(n for n, _ in accounts()) or 'none'}; "
+              f"features: {', '.join(k for k, v in features().items() if v) or 'none'}")
+    else:
+        print("baton     not set up" + (f" ({tilde(BATON)} exists but isn't a git repo)" if os.path.exists(BATON) else ""))
+
+    found = found_accounts()
+    print(f"\naccounts  {len(found)}")
+    for d, start in found.items():
+        signed = signed_in(d)
+        u = read_usage(d) if signed and "--usage" in args else {"error": "not signed in" if not signed else "skipped"}
+        if not signed:
+            state = "not signed in (start it once and /login)"
+        elif u.get("error") == "skipped":
+            state = "signed in"
+        elif u.get("error") == "offline":
+            state = "signed in · usage unknown (couldn't reach Anthropic)"
+        elif u.get("error"):
+            state = "signed in, but " + u["error"]
+        else:
+            state = f"signed in · 5-hour {pct_text(u.get('five'))} · weekly {pct_text(u.get('week'))}"
+        try:
+            st = json.loads(read(os.path.join(d, "settings.json")) or "{}")
+        except ValueError:
+            st = {}
+        joined = any(same(d, ad) for _, ad in accounts())
+        print(f"  {tilde(d)}  ({'joined' if joined else 'not joined'}; started with {start})")
+        print(f"    {state}")
+        print("    " + " · ".join(describe_link_or_count(d, x) for x in ("CLAUDE.md",) + SHARED))
+        own_hooks = hooks_summary(st)
+        line = st.get("statusLine") or {}
+        print("    hooks: " + (", ".join(own_hooks) if own_hooks else "none") + " · status line: "
+              + ("baton" if ours(line.get("command", "")) else "their own" if line else "none")
+              + " · memory folder: " + (st.get("autoMemoryDirectory") or "per project (default)"))
+        mem = [f for f in __import__("glob").glob(os.path.join(d, "projects", "*", "memory", "*.md"))]
+        if mem:
+            projects = {os.path.basename(os.path.dirname(os.path.dirname(f))) for f in mem}
+            print(f"    per-project memory: {len(mem)} files in {len(projects)} projects ({tilde(d)}/projects/*/memory)")
+    return 0
+
+# ---------------------------------------------------------------- commands
+
+def need_repo():
+    if not is_repo() or not accounts():
+        raise SystemExit("baton: not set up yet; run `baton init`")
+
+
+def opt(args, flag):
+    if flag in args:
+        i = args.index(flag)
+        if i + 1 < len(args):
+            return args[i + 1]
+        raise SystemExit(f"baton: {flag} needs a value")
+    return None
+
+
+def cmd_init(args):
+    import shutil
+    if not shutil.which("git"):
+        raise SystemExit("baton: needs git")
+    remote, gh = opt(args, "--remote"), opt(args, "--github")
+    fresh = not is_repo()
+    chosen = {f: (f"--{f}" in args) or None for f in ("handoff", "statusline")}
+    chosen.update({f: False for f in ("handoff", "statusline") if f"--no-{f}" in args})
+    if fresh and remote:
+        os.makedirs(os.path.dirname(BATON), exist_ok=True)
+        r = git("clone", "-q", remote, BATON, cwd=os.path.dirname(BATON), timeout=120)
+        if r.returncode != 0:
+            raise SystemExit(redact(f"baton: couldn't clone {remote}:\n{r.stderr.strip()}"))
+    elif fresh:
+        os.makedirs(BATON, exist_ok=True)
+        git("init", "-q")
+        git("symbolic-ref", "HEAD", "refs/heads/main")
+    elif remote and not has_remote():
+        git("remote", "add", "origin", remote)
+    scaffold()
+    ensure_merge_driver()
+    cfg = config()
+    cfg.setdefault("features", {}).update({f: v for f, v in chosen.items() if v is not None})
+    save_config(cfg)
+    notes = join(os.path.join(HOME, ".claude"), "claude")
+    for _, d in accounts():
+        if not is_default(d):
+            wire_settings(d)  # features may have changed
+    commit_all()
+    if gh:
+        if not shutil.which("gh"):
+            raise SystemExit("baton: --github needs the GitHub CLI (gh); or create a private repo and use --remote URL")
+        if not has_remote():
+            import subprocess
+            r = subprocess.run(["gh", "repo", "create", gh, "--private", "--source", BATON, "--remote", "origin", "--push"],
+                               capture_output=True, text=True)
+            if r.returncode != 0:
+                raise SystemExit(redact(f"baton: gh repo create failed:\n{r.stderr.strip()}"))
+    status = sync(push=True, wait=30)
+    print(f"Shared repo: {tilde(BATON)} ({status})")
+    print("Joined: claude (~/.claude)" + "".join(f"\n  {n}" for n in notes))
+    print("\nNext: `baton add` adds an account (~/.claude-b, started with `claudeb`). Restart open Claude sessions to load the hooks.")
+    if not has_remote():
+        print("Sync across machines and cloud sessions: `baton init --github my-claude` (private repo), or --remote URL.")
+    return 0
+
+
+def cmd_add(args):
+    import re
+    need_repo()
+    folder = opt(args, "--dir")
+    args = [a for a in args if a not in ("--dir", folder)]
+    if not args:  # the next free letter: b, c, d...
+        taken = {n for n, _ in accounts()}
+        args = [next(x for x in "bcdefghijklmnopqrstuvwxyz"
+                     if "claude" + x not in taken and not os.path.exists(os.path.join(HOME, ".claude-" + x)))]
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,30}", args[0]):
+        raise SystemExit("usage: baton add [NAME] [--dir FOLDER]   (`baton add` makes ~/.claude-b and claudeb; "
+                         "`baton add work` makes ~/.claude-work and claudework)")
+    name = "claude" + args[0]
+    d = os.path.abspath(os.path.expanduser(folder)) if folder else os.path.join(HOME, ".claude-" + args[0])
+    if is_default(d):
+        raise SystemExit("baton: ~/.claude is joined by `baton init`")
+    if same(d, BATON) or os.path.realpath(d).startswith(os.path.realpath(BATON) + os.sep):
+        raise SystemExit(f"baton: an account folder can't be inside {tilde(BATON)}")
+    if re.search(r'["$`\\]', d):
+        raise SystemExit('baton: the folder name can\'t contain " $ ` or \\')
+    notes = join(d, name)
+    commit_all()
+    print(f"Added {name} ({tilde(d)})." + "".join(f"\n  {n}" for n in notes))
+    print(f"Sign it in: run `{name}` and use /login with that account.")
+    if BIN not in os.environ.get("PATH", "").split(os.pathsep):
+        print(f"Add {tilde(BIN)} to your PATH to use `{name}`.")
+    return 0
+
+
+def cmd_leave(args):
+    need_repo()
+    if not args:
+        raise SystemExit("usage: baton leave DIR   (e.g. baton leave ~/.claude-b)")
+    d = os.path.abspath(os.path.expanduser(args[0]))
+    if not any(same(d, ad) for _, ad in accounts()):
+        raise SystemExit(f"baton: {tilde(d)} isn't a baton account; `baton status` lists them")
+    if os.path.exists(os.path.join(d, "settings.json")):
+        unwire_settings(d)
+    for item in ("CLAUDE.md",) + SHARED:
+        p = os.path.join(d, item)
+        if os.path.islink(p) and same(os.path.dirname(os.path.realpath(p)), BATON):
+            os.remove(p)
+            saved = os.path.join(d, "baton-backup", item)
+            if os.path.lexists(saved):
+                os.rename(saved, p)
+            elif item == "CLAUDE.md":
+                write(p, read(os.path.join(BATON, "CLAUDE.md")))  # keep the rules it was using
+    cfg = config()
+    name = next((n for n, ad in accounts() if same(ad, d)), None)
+    if name:
+        del cfg["accounts"][name]
+        save_config(cfg)
+        lp = os.path.join(BIN, name)
+        if "baton launcher" in read(lp):
+            os.remove(lp)
+    print(f"{tilde(d)} left baton; its own files are back. The shared repo stays in {tilde(BATON)}.")
+    return 0
+
+
+def pct_text(p):
+    return "–" if p is None else f"{float(p):.0f}%"
+
+
+def cmd_status(args):
+    need_repo()
+    me, th = current(), threshold()
+    rows = [("", "account", "5-hour", "resets", "weekly", "resets")]
+    for name, d in accounts():
+        u = usage(d, max_age=60)
+        mark = "*" if same(d, me) else ""
+        if u.get("error"):
+            rows.append((mark, name, "–", "", "–", u["error"]))
+        else:
+            rows.append((mark, name, pct_text(u.get("five")), clock(u.get("five_reset")),
+                         pct_text(u.get("week")), clock(u.get("week_reset"), True)))
+    widths = [max(len(r[i]) for r in rows) for i in range(6)]
+    for r in rows:
+        print("  ".join(c.ljust(w) for c, w in zip(r, widths)).rstrip())
+    print(f"\nHandoff at {th:.0f}%. * = this shell's account.")
+    return 0
+
+
+def cmd_statusline(args):
+    """Claude Code status line: every account's usage, this one in bold. Never waits on the network."""
+    if not sys.stdin.isatty():
+        sys.stdin.read()
+    import json
+    import subprocess
+    me, parts, stale = current(), [], False
+    for name, d in accounts():
+        try:
+            with open(cache_file(d)) as f:
+                u = json.load(f)
+        except (OSError, ValueError):
+            u = {"at": 0}
+        stale = stale or time.time() - u.get("at", 0) > FRESH
+        five, week = u.get("five"), u.get("week")
+        text = f"{name} " + ("?" if five is None and week is None else pct_text(five))
+        if week is not None and week >= 80:
+            text += f" (week {week:.0f}%)"
+        pct, _, reset = level(u)
+        if pct is not None and pct >= 80 and reset:
+            text += f" resets {clock(reset, True)}"
+        parts.append(f"\033[1m{text}\033[0m" if same(d, me) else text)
+    if stale:
+        subprocess.Popen([sys.executable, SCRIPT, "refresh"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+    print(" · ".join(parts))
+    return 0
+
+
+def cmd_refresh(args):
+    import fcntl
+    os.makedirs(CACHE, exist_ok=True)
+    with open(os.path.join(CACHE, "refresh.lock"), "w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return 0
+        for _, d in accounts():
+            usage(d)
+    return 0
+
+
+def cmd_sync(args):
+    need_repo()
+    print(sync(push=True, wait=30))
+    for n in tidy_notes():
+        print("\n" + n)
+    return 0
+
+
+def cmd_doctor(args):
+    import json
+    import shutil
+    ok = True
+
+    def check(good, text, fix=""):
+        nonlocal ok
+        ok = ok and good
+        print(("ok    " if good else "FIX   ") + text + ("" if good or not fix else f"\n      {fix}"))
+
+    check(sys.version_info >= (3, 8), f"python {sys.version.split()[0]}")
+    check(bool(shutil.which("git")), "git", "install git")
+    check(bool(shutil.which("claude")), "claude on PATH", "install Claude Code")
+    check(BIN in os.environ.get("PATH", "").split(os.pathsep), f"{tilde(BIN)} on PATH", f'add it: export PATH="$HOME/.local/bin:$PATH"')
+    check(is_repo(), f"shared repo {tilde(BATON)}", "run `baton init`")
+    if is_repo():
+        check(has_remote(), "remote for syncing", "baton init --github my-claude   (or --remote URL)")
+    for name, d in accounts():
+        md = os.path.join(d, "CLAUDE.md")
+        try:
+            s = json.loads(read(os.path.join(d, "settings.json")) or "{}")
+        except ValueError:
+            s = {}
+        wired = sum(ours(h.get("command", "")) for gs in s.get("hooks", {}).values() for g in gs for h in g.get("hooks", []))
+        good = os.path.islink(md) and same(md, os.path.join(BATON, "CLAUDE.md")) and wired >= len(hook_specs(d))
+        check(good, f"{name}: rules, memory and hooks linked", f"run `baton {'init' if is_default(d) else 'add ' + name[6:]}` again")
+        u = usage(d, max_age=60)
+        err = u.get("error")
+        check(err in (None, "offline"), f"{name}: " + ("usage readable" if not err else "signed in, usage unknown "
+              "(couldn't reach Anthropic)" if err == "offline" else err), f"start it once ({start_cmd(name, d)}) and sign in")
+    return 0 if ok else 1
+
+
+def cmd_update(args):
+    import urllib.request
+    new = urllib.request.urlopen(REPO_RAW, timeout=30).read().decode()
+    if not new.startswith("#!/usr/bin/env python3") or "def cmd_update" not in new:
+        raise SystemExit("baton: the download doesn't look like baton; not updated")
+    write(SCRIPT, new)
+    os.chmod(SCRIPT, 0o755)
+    print("baton updated." + (" Run `baton sync` to update the copy cloud sessions use." if is_repo() else ""))
+    return 0
+
+
+def cmd_hook(args):
+    try:
+        {"usage": hook_usage, "start": hook_start, "stop": hook_stop,
+         "cloud-start": hook_cloud_start, "cloud-stop": hook_cloud_stop}[args[0]]()
+    except Exception:
+        pass  # a hook never breaks the session
+    return 0
+
+
+COMMANDS = {"scan": cmd_scan, "init": cmd_init, "add": cmd_add, "leave": cmd_leave, "status": cmd_status, "next": cmd_next,
+            "sync": cmd_sync, "doctor": cmd_doctor, "update": cmd_update, "hook": cmd_hook, "merge": cmd_merge,
+            "statusline": cmd_statusline, "refresh": cmd_refresh}
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__.split("Installed into")[0].strip())
+        return 0
+    if argv[0] in ("-V", "--version", "version"):
+        print("baton " + VERSION)
+        return 0
+    if argv[0] not in COMMANDS:
+        print(f"baton: unknown command {argv[0]!r}; see `baton help`", file=sys.stderr)
+        return 2
+    return COMMANDS[argv[0]](argv[1:]) or 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
