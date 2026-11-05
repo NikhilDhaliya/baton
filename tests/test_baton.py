@@ -100,7 +100,7 @@ class Base(unittest.TestCase):
             json.dump({"claudeAiOauth": {"accessToken": tok}}, f)
 
     def env(self, home, **extra):
-        env = {k: v for k, v in os.environ.items() if not k.startswith(("CLAUDE", "BATON", "GIT_", "TMUX"))}
+        env = {k: v for k, v in os.environ.items() if not k.startswith(("CLAUDE", "BATON", "GIT_", "TMUX", "XDG_", "GH_"))}
         env.update(HOME=home, XDG_CACHE_HOME=os.path.join(home, ".cache"), GIT_CONFIG_NOSYSTEM="1",
                    BATON_USAGE_URL=f"http://127.0.0.1:{self.server.server_port}/usage",
                    PATH=os.path.join(home, ".local", "bin") + os.pathsep + os.environ["PATH"])
